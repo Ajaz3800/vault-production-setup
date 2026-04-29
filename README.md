@@ -1,6 +1,36 @@
-# 🔐 HashiCorp Vault – Production-Style Setup (Single Node)
+# 🔐 Vault + Kubernetes External Secrets (ESO) Full Setup Guide
 
-This guide documents a **production-style Vault setup on a single VM** for learning and future scaling to a cluster.
+This document provides a complete, step-by-step guide to integrate:
+
+HashiCorp Vault
+Kubernetes Authentication
+External Secrets Operator (ESO)
+
+It includes:
+
+CLI steps
+YAML configurations
+Clear explanations of why each component is required
+
+---
+
+# 📌 Architecture Overview
+
+```
+Vault (KV Secrets Engine)
+        ↓
+Kubernetes Auth (ServiceAccount)
+        ↓
+Vault Role + Policy
+        ↓
+ClusterSecretStore (ESO)
+        ↓
+ExternalSecret
+        ↓
+Kubernetes Secret
+        ↓
+Pod/Application
+```
 
 ---
 
@@ -19,6 +49,14 @@ This setup includes:
 
 ---
 
+# 🛠️ Install HashiCorp Vault
+
+Follow the official installation guide:
+
+👉 https://developer.hashicorp.com/vault/install
+
+---
+
 # 🖥️ Environment
 
 * OS: Ubuntu VM
@@ -26,6 +64,8 @@ This setup includes:
 * Vault Port: `8200`
 
 ---
+
+
 
 # ⚙️ 1. Vault Configuration (`vault.hcl`)
 
@@ -61,6 +101,44 @@ vault server -config=/etc/vault.d/vault.hcl
 
 ---
 
+# Self-Signed Certificate (dev only)
+
+```bash
+# 1. Create the configuration file
+cat > vault-san.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = 192.168.56.13
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+IP.1 = 192.168.56.13
+EOF
+
+# 2. Generate the new Key and Certificate
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /opt/vault/tls/tls.key \
+  -out /opt/vault/tls/tls.crt \
+  -config vault-san.cnf -extensions v3_req
+
+# 3. Set correct permissions
+sudo chown vault:vault /opt/vault/tls/tls.key /opt/vault/tls/tls.crt
+sudo chmod 640 /opt/vault/tls/tls.key /opt/vault/tls/tls.crt
+
+#. set files permissions
+sudo chown vault:vault /opt/vault/data/node-id /opt/vault/data/vault.db
+sudo chmod 640 /opt/vault/data/node-id /opt/vault/data/vault.db
+
+# 5. Restart Vault
+sudo systemctl restart vault
+```
+
 # 🔐 3. Set Environment Variables
 
 ```bash
@@ -71,9 +149,10 @@ export VAULT_SKIP_VERIFY=true   # temporary for self-signed cert
 ---
 
 # 🔑 4. Initialize Vault
+After starting Vault for the first time, you must initialize it.
 
 ```bash
-vault operator init
+vault operator init -format=json > vault-cluster-vault-init.json
 ```
 
 Save:
@@ -107,55 +186,57 @@ vault login <ROOT_TOKEN>
 vault secrets enable -path=secret kv-v2
 ```
 
-Test:
-
-```bash
-vault kv put secret/myapp username=admin password=123
-vault kv get secret/myapp
-```
-
 ---
 
-# 🛡️ 8. Create Policy (RBAC)
+# Store Secret in Vault
 
-Create file `app-policy.hcl`:
+```bash
+vault kv put secret/devsecops-gitops sshPrivateKey="test123"
+```
 
-```hcl
-path "secret/data/myapp" {
-  capabilities = ["read"]
+# 👤 Vault Userpass Authentication with Admin Policy
+
+This section explains how to create an admin user using Userpass auth method and assign a full access admin policy in HashiCorp Vault.
+
+# 🔐 1. Create Admin Policy
+
+Create policy file:
+```bash
+nano admin-policy.hcl
+```
+Paste the following:
+```bash
+# ADMIN POLICY - FULL ACCESS (USE CAREFULLY)
+path "*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
 }
 ```
-
-Apply:
-
+Apply policy:
 ```bash
-vault policy write app-policy app-policy.hcl
+vault policy write admin-policy admin-policy.hcl
 ```
-
----
-
-# 👤 9. Enable Authentication (Userpass)
-
+# 👤 2. Enable Userpass Authentication
 ```bash
 vault auth enable userpass
 ```
+⚠️ If already enabled, ignore the error.
 
-Create user:
+# 👤 Create Admin User:
 
 ```bash
 vault write auth/userpass/users/admin \
-  password=123 \
-  policies=app-policy
+    password="Admin@123" \
+    policies="admin-policy"
 ```
 
 ---
 
-# 🌐 10. Login via UI
+# Login via UI
 
 Open:
 
 ```
-https://192.168.56.13:8200
+https://<YOUR IP>:8200
 ```
 
 Use:
@@ -165,6 +246,198 @@ Use:
 * Password: 123
 
 ---
+
+# ☸️ 3. Enable Kubernetes Auth Method
+
+```bash
+vault auth enable kubernetes
+```
+
+---
+
+# 🧑‍💻 4. Create Kubernetes Service Account
+
+```bash
+nano sa.yaml
+```
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth
+  namespace: vault
+```
+
+```bash
+kubectl apply -f sa.yaml
+```
+---
+
+# 🔐 5. Configure Kubernetes Auth
+
+* For Cluter IP
+```bash
+kubectl cluster-info
+```
+* Create Service Account Tocken
+```bash
+kubectl create token vault-auth -n vault
+```
+
+* Export Kubernetes ca.crt
+```bash
+echo <certificate-authority-data> | base64 -d
+```
+
+```bash
+vault write auth/kubernetes/config \
+  kubernetes_host="https://<API-SERVER>:6443" \
+  kubernetes_ca_cert=@ca.crt \
+  token_reviewer_jwt="<jwt>"
+```
+
+
+---
+
+# 📜 6. Create Vault Policy
+
+```bash
+nano policy.hcl
+```
+
+```hcl
+path "secret/data/devsecops-gitops" {
+  capabilities = ["read"]
+}
+```
+
+
+```bash
+vault policy write devsecops-policy policy.hcl
+```
+
+---
+
+# 🔑 7. Create Kubernetes Auth Role
+
+```bash
+vault write auth/kubernetes/role/devsecops-role \
+  bound_service_account_names=vault-auth \
+  bound_service_account_namespaces=vault \
+  policies=devsecops-policy \
+  ttl=1h
+```
+
+---
+
+# 📦 8. Install External Secrets Operator (ESO)
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace
+```
+---
+
+# 🔗 9. Create ClusterSecretStore
+
+## Why?
+
+This connects Kubernetes to Vault.
+
+```bash
+nano clustersecretstore.yaml
+```
+
+* Optional
+```bash
+sudo cat /opt/vault/tls/tls.crt | base64 -w 0
+```
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: vault-backend
+spec:
+  provider:
+    vault:
+      server: "https://<VAULT-IP>:8200"
+      path: "secret"
+      version: "v2"
+      #caBundle: ""
+      auth:
+        kubernetes:
+          mountPath: "kubernetes"
+          role: "devsecops-role"
+          serviceAccountRef:
+            name: vault-auth
+            namespace: vault
+```
+
+```bash
+kubectl apply -f clustersecretstore.yaml
+```
+
+---
+
+# 🔐 10. Create ExternalSecret
+
+## Why?
+
+This fetches data from Vault and creates Kubernetes Secret.
+```bash
+nano externalsecret.yaml
+```
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vault-secret
+  namespace: vault
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: my-k8s-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: sshPrivateKey
+      remoteRef:
+        key: devsecops-gitops
+        property: sshPrivateKey
+```
+
+```bash
+kubectl apply -f externalsecret.yaml
+```
+
+---
+
+# ✅ Verification
+
+```bash
+kubectl get externalsecret -n vault
+kubectl get secret my-k8s-secret -n vault -o yaml
+```
+
+Expected:
+
+```
+READY: True
+```
+
+---
+
+# 🎯 Final Result
+
+* Secret stored in Vault
+* Automatically synced to Kubernetes
+* No hardcoded secrets in YAML
+
+---
+
 
 # 🤖 11. Enable AppRole (CI/CD)
 
