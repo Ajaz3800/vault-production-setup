@@ -23,13 +23,14 @@ Kubernetes Auth (ServiceAccount)
         ↓
 Vault Role + Policy
         ↓
-ClusterSecretStore (ESO)
-        ↓
-ExternalSecret
-        ↓
-Kubernetes Secret
-        ↓
-Pod/Application
+ClusterSecretStore (ESO)        SecretStore (ESO)
+(Cluster-wide access)           (Namespace-scoped access)
+        ↓                               ↓
+ExternalSecret                  ExternalSecret
+        ↓                               ↓
+Kubernetes Secret               Kubernetes Secret
+        ↓                               ↓
+Pod/Application                 Pod/Application
 ```
 
 ---
@@ -271,6 +272,26 @@ metadata:
 ```bash
 kubectl apply -f sa.yaml
 ```
+### Create Secret for token
+```bash
+nano vault-auth-token.yaml
+```
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-token
+  namespace: vault
+  annotations:
+    kubernetes.io/service-account.name: vault-auth
+type: kubernetes.io/service-account-token
+```
+```bash
+kubectl apply -f vault-auth-token.yaml
+```
+```bash
+kubectl get secret vault-auth-token -n vault -o jsonpath='{.data.token}' | base64 -d
+```
 ---
 
 # 🔐 5. Configure Kubernetes Auth
@@ -279,7 +300,7 @@ kubectl apply -f sa.yaml
 ```bash
 kubectl cluster-info
 ```
-* Create Service Account Tocken
+* Create Service Account Token
 ```bash
 kubectl create token vault-auth -n vault
 ```
@@ -338,11 +359,11 @@ helm install external-secrets external-secrets/external-secrets -n external-secr
 ```
 ---
 
-# 🔗 9. Create ClusterSecretStore
+# 🔗 9. Create ClusterSecretStore (For Single team evirment)
 
 ## Why?
 
-This connects Kubernetes to Vault.
+ClusterSecretStore is cluster-scoped. It allows any namespace in the cluster to reference it and fetch secrets from Vault. Best for platform/DevOps teams managing secrets centrally.
 
 ```bash
 nano clustersecretstore.yaml
@@ -372,10 +393,17 @@ spec:
           serviceAccountRef:
             name: vault-auth
             namespace: vault
+          secretRef:
+            name: vault-auth-token
+            namespace: vault
+            key: token  
 ```
 
 ```bash
 kubectl apply -f clustersecretstore.yaml
+```
+```bash
+kubectl get clustersecretstore
 ```
 
 ---
@@ -430,16 +458,195 @@ READY: True
 
 ---
 
-# 🎯 Final Result
+# 🏠 11. Create SecretStore (Namespace-Scoped)
+### Why SecretStore?
+### Unlike `ClusterSecretStore`, a `SecretStore` is namespace-scoped. It can only be used by `ExternalSecrets` within the same namespace. This is ideal for:
+- Multi-tenant clusters where teams need isolation
+- App-level secret management with dedicated Vault roles
+- Demonstrating least-privilege access per namespace
 
-* Secret stored in Vault
-* Automatically synced to Kubernetes
-* No hardcoded secrets in YAML
+
+> 💡 Both `ClusterSecretStore` and `SecretStore` can run simultaneously in the same cluster.
 
 ---
 
+# Step 1 — Create a Dedicated Namespace
+```bash
+kubectl create namespace dev
+```
+---
+# Step 2 — Create ServiceAccount in `dev` Namespace
+```bash
+nano sa-dev.yaml
+```
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth
+  namespace: dev
+```
+```bash
+kubectl apply -f sa-dev.yaml
+```
+### Create Static Token Secret for `dev` SA
+> ⚠️ Always use a static token secret (not kubectl create token) — short-lived tokens expire and cause 403 errors.
 
-# 🤖 11. Enable AppRole (CI/CD)
+```bash
+nano vault-auth-token-dev.yaml
+```
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-auth-token
+  namespace: dev
+  annotations:
+    kubernetes.io/service-account.name: vault-auth
+type: kubernetes.io/service-account-token
+```
+```bash
+kubectl apply -f vault-auth-token-dev.yaml
+```
+```bash
+kubectl get secret vault-auth-token -n dev -o jsonpath='{.data.token}' | base64 -d
+```
+
+# Step 3 — Store a Secret in Vault for dev
+
+```bash
+vault kv put secret/dev-app db_password="SuperSecret123"
+```
+
+# Step 4 — Create Vault Policy for dev
+```bash
+nano dev-policy.hcl
+```
+```
+path "secret/data/dev-app" {
+  capabilities = ["read"]
+}
+```
+```bash
+vault policy write dev-policy dev-policy.hcl
+```
+
+# Step 5 — Create Vault Role for dev Namespace
+
+```bash
+vault write -address="https://192.168.56.13:8200" -tls-skip-verify \
+  auth/kubernetes/role/dev-role \
+  bound_service_account_names=vault-auth \
+  bound_service_account_namespaces=dev \
+  policies=dev-policy \
+  ttl=1h
+```
+
+# Step 6 — Create SecretStore YAML
+
+```bash
+nano secretstore.yaml
+```
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-backend-local
+  namespace: dev
+spec:
+  provider:
+    vault:
+      server: "https://192.168.56.13:8200"
+      path: "secret"
+      version: "v2"
+      caBundle: "<same-caBundle-as-ClusterSecretStore>"
+      auth:
+        kubernetes:
+          mountPath: "kubernetes"
+          role: "dev-role"
+          serviceAccountRef:
+            name: vault-auth
+          secretRef:
+            name: vault-auth-token
+            key: token
+```
+```bash
+kubectl apply -f secretstore.yaml
+```
+```bash
+kubectl get secretstore -n dev
+```
+
+### Expected output:
+```
+NAME                  AGE   STATUS   CAPABILITIES   READY
+vault-backend-local   10s   Valid    ReadWrite      True
+```
+
+# Step 7 — Create ExternalSecret using SecretStore
+```bash
+nano externalsecret-dev.yaml
+```
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: dev-secret
+  namespace: dev
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend-local   
+    kind: SecretStore        
+  target:
+    name: dev-app-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: db_password
+      remoteRef:
+        key: dev-app         
+        property: db_password
+```
+
+---
+
+# ✅ Verification (SecretStore)
+
+```bash
+kubectl get secretstore -n dev
+```
+```bash
+kubectl get externalsecret -n dev
+```
+```bash
+kubectl get secret dev-app-secret -n dev -o yaml
+```
+```bash
+kubectl get secret dev-app-secret -n dev -o jsonpath='{.data.db_password}' | base64 -d
+```
+
+# Expected:
+```
+READY: True
+SuperSecret123
+```
+
+# 🔍 ClusterSecretStore vs SecretStore — Quick Comparison
+```
+Feature             ClusterSecretStore        SecretStore
+-------------------------------------------------------------------------
+Scope               Cluster-wide              Single namespace
+Who can use it      All namespaces            Same namespace only
+Vault Role Binding  One role for all          One role per namespace
+Best for            Platform / DevOps teams   App teams / multi-tenant
+Isolation           Lower                     Higher
+Management overhead Single config             One per namespace
+```
+> 🎯 Portfolio Tip: Running both simultaneously shows you understand centralized vs decentralized secrets management — a strong DevSecOps skill.
+
+---
+
+# 🤖 12. Enable AppRole (CI/CD)
 
 ```bash
 vault auth enable approle
@@ -452,7 +659,7 @@ vault write auth/approle/role/my-role \
 
 ---
 
-# 📊 12. Enable Audit Logging (IMPORTANT)
+# 📊 13. Enable Audit Logging (IMPORTANT)
 
 ## Fix permissions:
 
@@ -470,7 +677,7 @@ vault audit enable file file_path=/var/log/vault_audit.log
 
 ---
 
-# 🔍 13. Verify Audit Logs
+# 🔍 14. Verify Audit Logs
 
 ```bash
 vault kv put secret/test foo=bar
@@ -530,6 +737,30 @@ invalid username or password
 sudo -E vault <command>
 ```
 
+### ❌ ClusterSecretStore / SecretStore 403 Permission Denied
+
+```
+unable to log in with Kubernetes auth: Error making API request.
+Code: 403. Errors: permission denied
+```
+
+## ✅ Fix:
+- Never use `kubectl create token` — tokens expire and cause 403 errors
+- Always use a static `kubernetes.io/service-account-token` Secret
+- Verify SA name and namespace match exactly what is in the Vault role:
+```bash
+vault read auth/kubernetes/role/<role-name>
+```
+- Reconfigure Vault Kubernetes auth with the static token:
+```bash
+vault write auth/kubernetes/config \
+  kubernetes_host="https://<API-SERVER>:6443" \
+  token_reviewer_jwt="$(kubectl get secret vault-auth-token -n <namespace> \
+    -o jsonpath='{.data.token}' | base64 -d)" \
+  kubernetes_ca_cert="$(kubectl get secret vault-auth-token -n <namespace> \
+    -o jsonpath='{.data.ca\.crt}' | base64 -d)"
+```
+
 ---
 
 # 🔒 Security Best Practices
@@ -540,6 +771,8 @@ sudo -E vault <command>
 * Use TLS (HTTPS)
 * Restrict firewall access
 * Backup `/opt/vault/data`
+* Always use static SA token secrets (not short-lived tokens)
+* Use SecretStore per namespace for multi-tenant isolation
 
 ---
 
@@ -559,6 +792,8 @@ sudo -E vault <command>
 * Vault server runs as `vault` user (permission matters)
 * Raft storage is required for production
 * Audit logging is critical
+* kubectl create token generates short-lived tokens — always use static SA token secrets
+* ClusterSecretStore = platform-level; SecretStore = app-level
 
 ---
 
@@ -566,11 +801,13 @@ sudo -E vault <command>
 
 This setup provides:
 
-✅ Secure Vault with TLS
-✅ Production-style storage (Raft)
-✅ Authentication & RBAC
-✅ Audit logging
-✅ CI/CD ready (AppRole)
+✅ Secure Vault with TLS<br>
+✅ Production-style storage (Raft)<br>
+✅ Authentication & RBAC<br>
+✅ Audit logging<br>
+✅ CI/CD ready (AppRole)<br>
+✅ ClusterSecretStore (cluster-wide secrets)<br>
+✅ SecretStore (namespace-scoped secrets)<br>
 
 ❌ Not HA (single node)
 
