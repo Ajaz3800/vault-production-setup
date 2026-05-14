@@ -292,6 +292,27 @@ kubectl apply -f vault-auth-token.yaml
 ```bash
 kubectl get secret vault-auth-token -n vault -o jsonpath='{.data.token}' | base64 -d
 ```
+## Create Cluster Role Binding
+```bash
+nano cluster-role-binding.yaml
+```
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-token-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: vault-auth
+  namespace: vault
+```
+```bash
+kubectl apply -f cluster-role-binding.yaml
+```
 ---
 
 # 🔐 5. Configure Kubernetes Auth
@@ -314,7 +335,8 @@ echo <certificate-authority-data> | base64 -d
 vault write auth/kubernetes/config \
   kubernetes_host="https://<API-SERVER>:6443" \
   kubernetes_ca_cert=@ca.crt \
-  token_reviewer_jwt="<jwt>"
+  token_reviewer_jwt="<jwt>" \
+  disable_iss_validation=true
 ```
 
 
